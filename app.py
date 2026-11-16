@@ -1,0 +1,953 @@
+"""
+Indian Job Market Analysis - Streamlit dashboard
+=================================================
+Run:   streamlit run app.py
+Needs: cleaned_indian_job_market.csv in the same folder as this file.
+"""
+from __future__ import annotations
+
+import html
+import math
+import re
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+try:  # altair ships with streamlit, but we stay safe anyway
+    import altair as alt
+
+    HAS_ALTAIR = True
+except Exception:  # pragma: no cover
+    alt = None
+    HAS_ALTAIR = False
+
+# ------------------------------------------------------------------
+# PAGE SETTINGS (must be the first Streamlit call)
+# ------------------------------------------------------------------
+st.set_page_config(
+    page_title="Indian Job Market Analysis",
+    page_icon="💼",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+CSV_NAME = "cleaned_indian_job_market.csv"
+BRAND = "#2e75b6"
+BRAND_DARK = "#1f4e79"
+ACCENT = "#f59e0b"
+
+P_HOME = "🏠 Home"
+P_DASH = "📊 Dashboard"
+P_EXPL = "🔎 Job Explorer"
+P_CAREER = "🎯 Career Insights"
+PAGES = [P_HOME, P_DASH, P_EXPL, P_CAREER]
+
+EXP_ORDER = [
+    "Fresher (0-2 yrs)",
+    "Junior (3-5 yrs)",
+    "Mid-Level (6-9 yrs)",
+    "Senior (10-14 yrs)",
+    "Expert (15+ yrs)",
+]
+EXP_BINS = [-1, 2, 5, 9, 14, 1000]
+EXP_CAP = 20  # top end of the experience slider means "20+ / no limit"
+POSTED_OPTIONS = ["Any time", "Last 3 days", "Last 5 days", "Last 7 days"]
+WORK_MODES = ["On-site", "Hybrid", "Remote"]
+NON_CITY = {"Remote", "Unknown"}
+
+CITY_ALIASES = {
+    "bangalore": "Bengaluru",
+    "bangalore rural": "Bengaluru",
+    "bengaluru": "Bengaluru",
+    "bengaluru/bangalore": "Bengaluru",
+    "gurgaon": "Gurugram",
+    "new delhi": "Delhi",
+    "delhi / ncr": "Delhi NCR",
+    "delhi/ncr": "Delhi NCR",
+    "ncr": "Delhi NCR",
+    "bombay": "Mumbai",
+    "madras": "Chennai",
+    "calcutta": "Kolkata",
+    "navi mumbai": "Navi Mumbai",
+    "all india": "Remote",
+    "pan india": "Remote",
+}
+
+# ------------------------------------------------------------------
+# STYLING
+# ------------------------------------------------------------------
+CSS = f"""
+<style>
+.block-container {{padding-top: 2rem; padding-bottom: 3rem;}}
+footer {{visibility: hidden;}}
+.hero {{
+    background: linear-gradient(135deg, {BRAND_DARK}, {BRAND});
+    padding: 40px 30px; border-radius: 18px; text-align: center;
+    margin-bottom: 24px;
+}}
+.hero h1 {{color: white; margin: 0 0 8px 0; font-size: 2.1rem;}}
+.hero p {{color: rgba(255,255,255,.92); font-size: 1.05rem; margin: 0;}}
+.card {{
+    background: rgba(46,117,182,.10); border: 1px solid rgba(46,117,182,.35);
+    border-radius: 14px; padding: 22px; min-height: 190px;
+}}
+.card h3 {{margin-top: 0; font-size: 1.15rem;}}
+.card p {{margin-bottom: 0; opacity: .9;}}
+div[data-testid="stMetric"] {{
+    background: rgba(46,117,182,.08); border: 1px solid rgba(46,117,182,.25);
+    padding: 14px 16px; border-radius: 12px;
+}}
+.chip {{
+    display: inline-block; padding: 3px 11px; margin: 3px 4px 3px 0;
+    border-radius: 999px; font-size: .82rem;
+    background: rgba(46,117,182,.15); border: 1px solid rgba(46,117,182,.4);
+}}
+.section-note {{opacity: .7; font-size: .85rem;}}
+</style>
+"""
+
+
+def banner(title: str, subtitle: str) -> None:
+    st.markdown(
+        f'<div class="hero"><h1>{html.escape(title)}</h1>'
+        f"<p>{html.escape(subtitle)}</p></div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ------------------------------------------------------------------
+# VERSION-SAFE STREAMLIT WRAPPERS
+# ------------------------------------------------------------------
+def show_chart(chart) -> None:
+    for kwargs in ({"use_container_width": True}, {}):
+        try:
+            st.altair_chart(chart, **kwargs)
+            return
+        except TypeError:
+            continue
+
+
+def show_table(data: pd.DataFrame, height: int | None = None, column_config=None) -> None:
+    extra = {}
+    if height:
+        extra["height"] = height
+    if column_config:
+        extra["column_config"] = column_config
+    for kwargs in ({"use_container_width": True}, {}):
+        try:
+            st.dataframe(data, hide_index=True, **extra, **kwargs)
+            return
+        except TypeError:
+            continue
+
+
+# ------------------------------------------------------------------
+# DATA CLEANING
+# ------------------------------------------------------------------
+def parse_locations(raw: str) -> tuple[list[str], str]:
+    """Return (list of clean cities, work mode)."""
+    text = str(raw or "").strip()
+    low = text.lower()
+    is_remote = bool(re.search(r"remote|work from home|wfh", low))
+    is_hybrid = "hybrid" in low
+    mode = "Remote" if is_remote else ("Hybrid" if is_hybrid else "On-site")
+
+    text = re.sub(r"\(.*?\)", "", text)  # drop "(Sector 63)", "(All Areas)" ...
+    text = re.sub(
+        r"^\s*(hybrid|remote|work from home|wfh)\s*[-:–]*\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"delhi\s*/\s*ncr", "Delhi NCR", text, flags=re.IGNORECASE)
+
+    cities: list[str] = []
+    for part in re.split(r"[,;|]", text):
+        name = part.strip(" -–")
+        if not name:
+            continue
+        name = CITY_ALIASES.get(name.lower(), name)
+        if name.lower() in {"remote", "work from home", "wfh"}:
+            name = "Remote"
+        if name not in cities:
+            cities.append(name)
+    if not cities:
+        cities = ["Remote"] if is_remote else ["Unknown"]
+    return cities, mode
+
+
+def clean_description(value: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", str(value or ""), flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def parse_posted_days(value: str) -> float:
+    low = str(value or "").lower()
+    if re.search(r"today|just now|hour|minute|few", low):
+        return 0.0
+    match = re.search(r"(\d+)", low)
+    return float(match.group(1)) if match else np.nan
+
+
+def prepare(raw: pd.DataFrame) -> pd.DataFrame:
+    """Clean the CSV and add helper columns used by every page."""
+    df = raw.copy()
+
+    text_cols = [
+        "title", "companyName", "tagsAndSkills", "experience", "salary",
+        "location", "jobUploaded", "jobDescription", "currency",
+    ]
+    num_cols = [
+        "jobId", "companyId", "ReviewsCount", "AggregateRating",
+        "minimumSalary", "maximumSalary", "minimumExperience",
+        "maximumExperience", "average_salary",
+    ]
+    for col in text_cols:
+        df[col] = df[col].fillna("").astype(str).str.strip() if col in df else ""
+    for col in num_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce") if col in df else np.nan
+
+    df["title"] = df["title"].replace("", "Untitled")
+    df["companyName"] = df["companyName"].replace("", "Unknown")
+    df["currency"] = df["currency"].str.upper().replace("", "INR")
+    df = df.reset_index(drop=True)
+
+    # --- salary (INR only, in lakhs per annum) ---
+    avg = df["average_salary"].fillna((df["minimumSalary"] + df["maximumSalary"]) / 2)
+    df["salary_lpa"] = np.where((df["currency"] == "INR") & (avg > 0), avg / 1e5, np.nan)
+
+    # --- experience ---
+    parsed = df["experience"].str.extract(r"(\d+)\s*-\s*(\d+)").astype(float)
+    df["exp_min"] = df["minimumExperience"].fillna(parsed[0])
+    df["exp_max"] = df["maximumExperience"].fillna(parsed[1]).fillna(df["exp_min"])
+    df["exp_level"] = (
+        pd.cut(df["exp_min"], bins=EXP_BINS, labels=EXP_ORDER)
+        .astype(object)
+        .where(df["exp_min"].notna(), "Other")
+    )
+
+    # --- location ---
+    parsed_loc = df["location"].apply(parse_locations)
+    df["cities"] = parsed_loc.apply(lambda x: x[0])
+    df["work_mode"] = parsed_loc.apply(lambda x: x[1])
+    df["primary_city"] = df["cities"].apply(lambda x: x[0])
+
+    # --- skills (merge different capitalisations of the same skill) ---
+    token_lists = df["tagsAndSkills"].apply(
+        lambda s: [t.strip() for t in re.split(r"[,|;]", s) if 1 < len(t.strip()) <= 40]
+    )
+    forms: dict[str, Counter] = {}
+    for tokens in token_lists:
+        for tok in tokens:
+            forms.setdefault(tok.lower(), Counter())[tok] += 1
+    canonical = {k: v.most_common(1)[0][0] for k, v in forms.items()}
+
+    def canon_list(tokens: list[str]) -> list[str]:
+        seen: list[str] = []
+        for tok in tokens:
+            name = canonical[tok.lower()]
+            if name not in seen:
+                seen.append(name)
+        return seen
+
+    df["skills"] = token_lists.apply(canon_list)
+
+    # --- misc ---
+    df["posted_days"] = df["jobUploaded"].apply(parse_posted_days)
+    df["desc_clean"] = df["jobDescription"].apply(clean_description)
+    return df
+
+
+@st.cache_data(show_spinner="Loading data...")
+def load_data(path: str) -> pd.DataFrame:
+    return prepare(pd.read_csv(path))
+
+
+def get_data() -> pd.DataFrame:
+    here = Path(__file__).resolve().parent
+    for candidate in (here / CSV_NAME, Path.cwd() / CSV_NAME):
+        if candidate.exists():
+            return load_data(str(candidate))
+
+    st.error(f"`{CSV_NAME}` was not found next to app.py. Upload it below.")
+    uploaded = st.file_uploader("Upload the CSV file", type="csv")
+    if uploaded is None:
+        st.stop()
+    return prepare(pd.read_csv(uploaded))
+
+
+def build_meta(df: pd.DataFrame) -> dict:
+    sal = df["salary_lpa"].dropna()
+    q99 = float(sal.quantile(0.99)) if len(sal) else 10.0
+    sal_cap = float(max(10, math.ceil(q99 / 5) * 5))
+
+    cities = df["cities"].explode().dropna()
+    cities = cities[~cities.isin(NON_CITY)]
+    skills = df["skills"].explode().dropna()
+    return {
+        "sal_cap": sal_cap,
+        "city_options": cities.value_counts().head(60).index.tolist(),
+        "skill_options": skills.value_counts().head(100).index.tolist(),
+    }
+
+
+# ------------------------------------------------------------------
+# FILTERS (shared by Dashboard + Job Explorer)
+# ------------------------------------------------------------------
+def default_filters(meta: dict) -> dict:
+    return {
+        "f_kw": "",
+        "f_company": "",
+        "f_cities": [],
+        "f_skills": [],
+        "f_exp": (0, EXP_CAP),
+        "f_sal": (0.0, meta["sal_cap"]),
+        "f_posted": "Any time",
+        "f_mode": [],
+        "f_rating": 0.0,
+    }
+
+
+def apply_filters(df: pd.DataFrame, f: dict, sal_cap: float) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+
+    kw = str(f["f_kw"]).strip()
+    if kw:
+        mask &= (
+            df["title"].str.contains(kw, case=False, regex=False)
+            | df["companyName"].str.contains(kw, case=False, regex=False)
+            | df["tagsAndSkills"].str.contains(kw, case=False, regex=False)
+        )
+    company = str(f["f_company"]).strip()
+    if company:
+        mask &= df["companyName"].str.contains(company, case=False, regex=False)
+
+    if f["f_cities"]:
+        wanted = set(f["f_cities"])
+        mask &= df["cities"].apply(lambda lst: not wanted.isdisjoint(lst))
+    if f["f_skills"]:
+        wanted = set(f["f_skills"])
+        mask &= df["skills"].apply(lambda lst: not wanted.isdisjoint(lst))
+
+    lo, hi = f["f_exp"]
+    if lo > 0:
+        mask &= df["exp_max"] >= lo
+    if hi < EXP_CAP:
+        mask &= df["exp_min"] <= hi
+
+    lo, hi = f["f_sal"]
+    if lo > 0:
+        mask &= df["salary_lpa"] >= lo
+    if hi < sal_cap:
+        mask &= df["salary_lpa"] <= hi
+
+    if f["f_posted"] != "Any time":
+        days = int(re.search(r"\d+", f["f_posted"]).group())
+        mask &= df["posted_days"] <= days
+    if f["f_mode"]:
+        mask &= df["work_mode"].isin(f["f_mode"])
+    if f["f_rating"] and f["f_rating"] > 0:
+        mask &= df["AggregateRating"] >= f["f_rating"]
+    return df[mask]
+
+
+def keep_filters_alive(meta: dict) -> None:
+    """Streamlit forgets widget values on pages that don't render them."""
+    for key in default_filters(meta):
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+
+def render_filters(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    defaults = default_filters(meta)
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+    def reset() -> None:
+        for k, v in default_filters(meta).items():
+            st.session_state[k] = v
+
+    sb = st.sidebar
+    sb.divider()
+    sb.subheader("🔍 Filters")
+    sb.text_input("Keyword (title / skill / company)", key="f_kw", placeholder="e.g. python, C++, TCS")
+    sb.multiselect("📍 City", meta["city_options"], key="f_cities", placeholder="All cities")
+    sb.multiselect("🧠 Skills (any of)", meta["skill_options"], key="f_skills", placeholder="All skills")
+    sb.slider(f"💼 Experience (years, {EXP_CAP} = {EXP_CAP}+)", 0, EXP_CAP, key="f_exp")
+    sb.slider(
+        f"💰 Salary (LPA, {meta['sal_cap']:g} = no limit)",
+        0.0, float(meta["sal_cap"]), step=0.5, key="f_sal",
+    )
+    sb.multiselect("🏠 Work mode", WORK_MODES, key="f_mode", placeholder="All")
+    sb.selectbox("🕒 Posted", POSTED_OPTIONS, key="f_posted")
+    sb.text_input("🏢 Company contains", key="f_company")
+    sb.slider("⭐ Min company rating", 0.0, 5.0, step=0.5, key="f_rating")
+    sb.button("↺ Reset filters", on_click=reset)
+
+    values = {key: st.session_state[key] for key in defaults}
+    out = apply_filters(df, values, meta["sal_cap"])
+    sb.caption(f"Showing **{len(out):,}** of {len(df):,} jobs")
+    return out
+
+
+# ------------------------------------------------------------------
+# SMALL HELPERS + CHARTS
+# ------------------------------------------------------------------
+def lpa(x) -> str:
+    return "—" if x is None or pd.isna(x) else f"₹{x:,.1f} LPA"
+
+
+def counts_df(series: pd.Series, label: str, top: int = 10) -> pd.DataFrame:
+    vc = series.dropna().value_counts().head(top)
+    return pd.DataFrame({label: vc.index.astype(str), "Jobs": vc.values})
+
+
+def hbar(data: pd.DataFrame, cat: str, val: str, fmt: str = ",.0f", color: str = BRAND) -> None:
+    if data.empty:
+        st.info("Not enough data for the current filters.")
+        return
+    d = data[[cat, val]].copy()
+    d[cat] = d[cat].astype(str)
+    if not HAS_ALTAIR:
+        st.bar_chart(d.set_index(cat)[val])
+        return
+    chart = (
+        alt.Chart(d)
+        .mark_bar(color=color, cornerRadiusEnd=3)
+        .encode(
+            x=alt.X(f"{val}:Q", title=val),
+            y=alt.Y(f"{cat}:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
+            tooltip=[alt.Tooltip(f"{cat}:N"), alt.Tooltip(f"{val}:Q", format=fmt)],
+        )
+        .properties(height=max(200, 30 * len(d) + 40))
+    )
+    show_chart(chart)
+
+
+def vbar(data: pd.DataFrame, cat: str, val: str, order: list[str] | None = None,
+         fmt: str = ",.0f", color: str = BRAND) -> None:
+    if data.empty:
+        st.info("Not enough data for the current filters.")
+        return
+    d = data[[cat, val]].copy()
+    d[cat] = d[cat].astype(str)
+    if not HAS_ALTAIR:
+        st.bar_chart(d.set_index(cat)[val])
+        return
+    chart = (
+        alt.Chart(d)
+        .mark_bar(color=color, cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X(f"{cat}:N", sort=order if order else "-y", title=None,
+                    axis=alt.Axis(labelAngle=0, labelLimit=140)),
+            y=alt.Y(f"{val}:Q", title=val),
+            tooltip=[alt.Tooltip(f"{cat}:N"), alt.Tooltip(f"{val}:Q", format=fmt)],
+        )
+        .properties(height=300)
+    )
+    show_chart(chart)
+
+
+def donut(data: pd.DataFrame, cat: str, val: str) -> None:
+    if data.empty:
+        st.info("Not enough data for the current filters.")
+        return
+    d = data[[cat, val]].copy()
+    d[cat] = d[cat].astype(str)
+    if not HAS_ALTAIR:
+        st.bar_chart(d.set_index(cat)[val])
+        return
+    chart = (
+        alt.Chart(d)
+        .mark_arc(innerRadius=60)
+        .encode(
+            theta=alt.Theta(f"{val}:Q"),
+            color=alt.Color(f"{cat}:N", title=None),
+            tooltip=[alt.Tooltip(f"{cat}:N"), alt.Tooltip(f"{val}:Q", format=",.0f")],
+        )
+        .properties(height=300)
+    )
+    show_chart(chart)
+
+
+def salary_hist(series: pd.Series, bins: int = 30) -> int:
+    """Histogram of salaries up to the 99th percentile. Returns #outliers hidden."""
+    s = series.dropna()
+    if s.empty:
+        st.info("No salary data for the current filters.")
+        return 0
+    cap = float(s.quantile(0.99))
+    inside = s[s <= cap]
+    counts, edges = np.histogram(inside, bins=bins)
+    d = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "Jobs": counts})
+    if not HAS_ALTAIR:
+        st.bar_chart(d.assign(Salary=d["start"].round(1)).set_index("Salary")["Jobs"])
+    else:
+        chart = (
+            alt.Chart(d)
+            .mark_bar(color=BRAND)
+            .encode(
+                x=alt.X("start:Q", title="Salary (LPA)"),
+                x2="end:Q",
+                y=alt.Y("Jobs:Q", title="Number of jobs"),
+                tooltip=[
+                    alt.Tooltip("start:Q", title="From (LPA)", format=".1f"),
+                    alt.Tooltip("end:Q", title="To (LPA)", format=".1f"),
+                    alt.Tooltip("Jobs:Q"),
+                ],
+            )
+            .properties(height=300)
+        )
+        show_chart(chart)
+    return int(len(s) - len(inside))
+
+
+def salary_scatter(d: pd.DataFrame) -> None:
+    s = d.dropna(subset=["salary_lpa", "exp_min"])
+    if s.empty:
+        st.info("Not enough data for the current filters.")
+        return
+    s = s[s["salary_lpa"] <= s["salary_lpa"].quantile(0.99)]
+    if len(s) > 2500:
+        s = s.sample(2500, random_state=1)
+    s = s[["title", "companyName", "exp_min", "salary_lpa"]].copy()
+    if not HAS_ALTAIR:
+        st.scatter_chart(s, x="exp_min", y="salary_lpa") if hasattr(st, "scatter_chart") else None
+        return
+    chart = (
+        alt.Chart(s)
+        .mark_circle(size=45, opacity=0.45, color=BRAND)
+        .encode(
+            x=alt.X("exp_min:Q", title="Minimum experience (years)"),
+            y=alt.Y("salary_lpa:Q", title="Salary (LPA)"),
+            tooltip=[
+                alt.Tooltip("title:N", title="Role"),
+                alt.Tooltip("companyName:N", title="Company"),
+                alt.Tooltip("exp_min:Q", title="Min exp (yrs)"),
+                alt.Tooltip("salary_lpa:Q", title="Salary (LPA)", format=".1f"),
+            ],
+        )
+        .properties(height=320)
+    )
+    show_chart(chart)
+
+
+def chips(items: list[str]) -> str:
+    return "".join(f'<span class="chip">{html.escape(str(i))}</span>' for i in items)
+
+
+def table_columns(d: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(
+        {
+            "Job Title": d["title"],
+            "Company": d["companyName"],
+            "Location": d["location"],
+            "Experience": d["experience"],
+            "Salary": d["salary"],
+            "Avg Salary (LPA)": d["salary_lpa"].round(1),
+            "Rating": d["AggregateRating"],
+            "Posted": d["jobUploaded"],
+        }
+    )
+    return out
+
+
+TABLE_CONFIG = None
+if hasattr(st, "column_config"):
+    TABLE_CONFIG = {
+        "Avg Salary (LPA)": st.column_config.NumberColumn(format="%.1f"),
+        "Rating": st.column_config.NumberColumn(format="%.1f"),
+    }
+
+
+# ------------------------------------------------------------------
+# PAGE: HOME
+# ------------------------------------------------------------------
+def page_home(df: pd.DataFrame) -> None:
+    banner(
+        "💼 Indian Job Market Analysis",
+        "Explore jobs, companies, salaries, skills and career trends in the Indian job market.",
+    )
+
+    cities = df["cities"].explode().dropna()
+    cities = cities[~cities.isin(NON_CITY)]
+    skills = df["skills"].explode().dropna()
+    median_sal = df["salary_lpa"].median()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("💼 Total Jobs", f"{len(df):,}")
+    c2.metric("🏢 Companies", f"{df['companyName'].nunique():,}")
+    c3.metric("📍 Cities", f"{cities.nunique():,}")
+    c4.metric("💰 Median Salary", lpa(median_sal))
+
+    st.divider()
+    st.subheader("📌 Market Snapshot")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Top Hiring City", cities.value_counts().index[0] if len(cities) else "—")
+    s2.metric("Top Skill", skills.value_counts().index[0] if len(skills) else "—")
+    remote_share = (df["work_mode"] != "On-site").mean() * 100
+    s3.metric("Remote / Hybrid Jobs", f"{remote_share:.0f}%")
+    lvl = (
+        df.dropna(subset=["salary_lpa"]).groupby("exp_level")["salary_lpa"].median()
+        .reindex(EXP_ORDER).dropna()
+    )
+    s4.metric("Best-Paid Level", lvl.idxmax().split(" (")[0] if len(lvl) else "—")
+
+    st.divider()
+    st.subheader("🚀 Explore the Platform")
+    cards = [
+        ("📊 Dashboard", "Interactive charts for companies, cities, experience levels, "
+                         "salaries and skills - with powerful sidebar filters."),
+        ("🔎 Job Explorer", "Search, sort and page through every job. Open a job to see "
+                            "skills and the full description, and download results as CSV."),
+        ("🎯 Career Insights", "Enter your role, skill, city and experience to see the salary "
+                               "range people get - plus the skills to learn next."),
+        ("🧠 Skills Discovery", "Find the most in-demand skills and which skills pay the most "
+                                "(Dashboard → Skills tab)."),
+    ]
+    cols = st.columns(len(cards))
+    for col, (title, text) in zip(cols, cards):
+        col.markdown(
+            f'<div class="card"><h3>{html.escape(title)}</h3><p>{html.escape(text)}</p></div>',
+            unsafe_allow_html=True,
+        )
+    st.info("👈 Use the sidebar to open the Dashboard, Job Explorer or Career Insights.")
+
+
+# ------------------------------------------------------------------
+# PAGE: DASHBOARD
+# ------------------------------------------------------------------
+def page_dashboard(d: pd.DataFrame, full: pd.DataFrame) -> None:
+    banner("📊 Job Market Dashboard",
+           "Companies, locations, salaries, skills and experience trends")
+
+    if d.empty:
+        st.warning("No jobs match the current filters. Try widening them or click **Reset filters**.")
+        return
+
+    avg_exp = ((d["exp_min"] + d["exp_max"]) / 2).mean()
+    rating = d["AggregateRating"].mean()
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("💼 Jobs", f"{len(d):,}", help=f"{len(d) / len(full):.0%} of all {len(full):,} jobs")
+    k2.metric("🏢 Companies", f"{d['companyName'].nunique():,}")
+    k3.metric("💰 Median Salary", lpa(d["salary_lpa"].median()))
+    k4.metric("🎓 Avg Experience", "—" if pd.isna(avg_exp) else f"{avg_exp:.1f} yrs")
+    k5.metric("⭐ Avg Rating", "—" if pd.isna(rating) else f"{rating:.1f} / 5",
+              help="Only jobs whose company has a rating")
+    st.write("")
+
+    t_over, t_sal, t_skill, t_comp, t_data = st.tabs(
+        ["📈 Overview", "💰 Salary", "🧠 Skills", "🏢 Companies & Cities", "📋 Data"]
+    )
+
+    # ---------------- Overview ----------------
+    with t_over:
+        a, b = st.columns(2)
+        with a:
+            st.subheader("📍 Top 10 Cities")
+            cities = d["cities"].explode().dropna()
+            cities = cities[~cities.isin(NON_CITY)]
+            hbar(counts_df(cities, "City"), "City", "Jobs")
+            st.caption("Jobs listing several cities count towards each city.")
+        with b:
+            st.subheader("🏢 Top 10 Hiring Companies")
+            hbar(counts_df(d["companyName"], "Company"), "Company", "Jobs")
+
+        a, b = st.columns(2)
+        with a:
+            st.subheader("💼 Jobs by Experience Level")
+            lvl = counts_df(d["exp_level"], "Level", top=10)
+            vbar(lvl, "Level", "Jobs", order=EXP_ORDER + ["Other"])
+        with b:
+            st.subheader("🏠 Work Mode")
+            donut(counts_df(d["work_mode"], "Mode"), "Mode", "Jobs")
+
+        st.subheader("🕒 When Were Jobs Posted?")
+        posted = d["posted_days"].dropna().astype(int).value_counts().sort_index()
+        pdf = pd.DataFrame({"Days ago": [f"{i}d" for i in posted.index], "Jobs": posted.values})
+        vbar(pdf, "Days ago", "Jobs", order=pdf["Days ago"].tolist())
+
+    # ---------------- Salary ----------------
+    with t_sal:
+        sal = d.dropna(subset=["salary_lpa"])
+        if sal.empty:
+            st.info("No INR salary data for the current filters.")
+        else:
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Median", lpa(sal["salary_lpa"].median()))
+            s2.metric("Average", lpa(sal["salary_lpa"].mean()))
+            s3.metric("Lowest", lpa(sal["salary_lpa"].min()))
+            s4.metric("Highest", lpa(sal["salary_lpa"].max()))
+            st.caption("Salaries are shown in lakhs per annum (LPA, INR jobs only). "
+                       "Non-INR jobs are excluded from salary statistics.")
+
+            a, b = st.columns(2)
+            with a:
+                st.subheader("📊 Salary Distribution")
+                hidden = salary_hist(sal["salary_lpa"])
+                if hidden:
+                    st.caption(f"{hidden} very high salaries (top 1%) hidden for readability.")
+            with b:
+                st.subheader("💰 Salary by Experience Level")
+                g = (
+                    sal.groupby("exp_level")["salary_lpa"].median()
+                    .reindex(EXP_ORDER).dropna().rename("Median LPA")
+                    .rename_axis("Level").reset_index()
+                )
+                vbar(g, "Level", "Median LPA", order=EXP_ORDER, fmt=".1f", color=ACCENT)
+
+            st.subheader("🎯 Salary vs Experience")
+            salary_scatter(sal)
+
+            st.subheader("📍 Best-Paying Cities (median)")
+            min_jobs = st.slider("Minimum jobs per city", 3, 50, 10, key="d_min_city")
+            c = sal[~sal["primary_city"].isin(NON_CITY)]
+            agg = c.groupby("primary_city")["salary_lpa"].agg(["median", "count"])
+            agg = agg[agg["count"] >= min_jobs].sort_values("median", ascending=False).head(10)
+            agg = agg.rename(columns={"median": "Median LPA"}).rename_axis("City").reset_index()
+            hbar(agg, "City", "Median LPA", fmt=".1f", color=ACCENT)
+
+            st.subheader("🏆 Top 10 Highest-Paying Jobs")
+            top = sal.nlargest(10, "salary_lpa")
+            show_table(table_columns(top).drop(columns=["Posted"]), column_config=TABLE_CONFIG)
+
+    # ---------------- Skills ----------------
+    with t_skill:
+        skills = d["skills"].explode().dropna()
+        a, b = st.columns(2)
+        with a:
+            st.subheader("🧠 Most In-Demand Skills")
+            hbar(counts_df(skills, "Skill", top=15), "Skill", "Jobs")
+        with b:
+            st.subheader("💎 Highest-Paying Skills (median)")
+            min_skill = st.slider("Minimum jobs per skill", 3, 50, 10, key="d_min_skill")
+            e = d.dropna(subset=["salary_lpa"])[["skills", "salary_lpa"]].explode("skills")
+            e = e.dropna(subset=["skills"])
+            agg = e.groupby("skills")["salary_lpa"].agg(["median", "count"])
+            agg = agg[agg["count"] >= min_skill].sort_values("median", ascending=False).head(15)
+            agg = agg.rename(columns={"median": "Median LPA"}).rename_axis("Skill").reset_index()
+            hbar(agg, "Skill", "Median LPA", fmt=".1f", color=ACCENT)
+
+    # ---------------- Companies & cities ----------------
+    with t_comp:
+        a, b = st.columns(2)
+        with a:
+            st.subheader("⭐ Best-Rated Companies")
+            r = d.dropna(subset=["AggregateRating"])
+            r = r[r["ReviewsCount"].fillna(0) >= 100]
+            if r.empty:
+                st.info("No rated companies (100+ reviews) for the current filters.")
+            else:
+                g = r.groupby("companyName").agg(
+                    Rating=("AggregateRating", "max"),
+                    Reviews=("ReviewsCount", "max"),
+                    Jobs=("jobId", "count"),
+                ).sort_values(["Rating", "Reviews"], ascending=False).head(10).reset_index()
+                g = g.rename(columns={"companyName": "Company"})
+                show_table(g, column_config=TABLE_CONFIG)
+        with b:
+            st.subheader("📍 City Summary")
+            c = d[~d["primary_city"].isin(NON_CITY)]
+            if c.empty:
+                st.info("No city data for the current filters.")
+            else:
+                g = c.groupby("primary_city").agg(
+                    Jobs=("jobId", "count"),
+                    Median_LPA=("salary_lpa", "median"),
+                    Companies=("companyName", "nunique"),
+                ).sort_values("Jobs", ascending=False).head(10).reset_index()
+                g = g.rename(columns={"primary_city": "City", "Median_LPA": "Median LPA"})
+                g["Median LPA"] = g["Median LPA"].round(1)
+                show_table(g)
+
+    # ---------------- Data ----------------
+    with t_data:
+        st.subheader("📋 Job Data")
+        show_table(table_columns(d).head(200), height=420, column_config=TABLE_CONFIG)
+        st.caption(f"Showing the first {min(200, len(d))} of {len(d):,} matching jobs. "
+                   "Use the Job Explorer for full search and paging.")
+        st.download_button(
+            "⬇️ Download filtered data (CSV)",
+            data=table_columns(d).to_csv(index=False).encode("utf-8"),
+            file_name="filtered_jobs.csv",
+            mime="text/csv",
+        )
+
+
+# ------------------------------------------------------------------
+# PAGE: JOB EXPLORER
+# ------------------------------------------------------------------
+SORTS = {
+    "Newest first": ("posted_days", True),
+    "Highest salary": ("salary_lpa", False),
+    "Lowest salary": ("salary_lpa", True),
+    "Lowest experience": ("exp_min", True),
+    "Highest experience": ("exp_min", False),
+    "Best company rating": ("AggregateRating", False),
+}
+
+
+def page_explorer(d: pd.DataFrame) -> None:
+    banner("🔎 Job Explorer", "Search, sort and explore job opportunities")
+
+    if d.empty:
+        st.warning("No jobs match the current filters. Try widening them or click **Reset filters**.")
+        return
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    sort_name = c1.selectbox("Sort by", list(SORTS.keys()))
+    page_size = c2.selectbox("Jobs per page", [25, 50, 100], index=1)
+    col, asc = SORTS[sort_name]
+    d = d.sort_values(col, ascending=asc, na_position="last", kind="mergesort")
+
+    pages = max(1, math.ceil(len(d) / page_size))
+    if pages > 1:
+        if st.session_state.get("exp_page", 1) > pages:
+            st.session_state["exp_page"] = pages
+        page = int(c3.number_input("Page", min_value=1, max_value=pages, step=1, key="exp_page"))
+    else:
+        page = 1
+        c3.markdown("**Page** 1 / 1")
+
+    start = (page - 1) * page_size
+    chunk = d.iloc[start:start + page_size]
+
+    st.subheader(f"Available Jobs ({len(d):,})")
+    show_table(table_columns(chunk), height=480, column_config=TABLE_CONFIG)
+    st.caption(f"Page {page} of {pages} · rows {start + 1:,}-{start + len(chunk):,} of {len(d):,}")
+
+    st.download_button(
+        "⬇️ Download all matching jobs (CSV)",
+        data=table_columns(d).to_csv(index=False).encode("utf-8"),
+        file_name="job_search_results.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
+    st.subheader("📄 Job Details")
+    labels = {
+        idx: f"{row['title'][:70]} - {row['companyName'][:40]}"
+        for idx, row in chunk.iterrows()
+    }
+    pick = st.selectbox(
+        "Select a job from this page", list(labels.keys()), format_func=lambda k: labels[k]
+    )
+    job = chunk.loc[pick]
+
+    st.markdown(f"### {job['title']}")
+    st.markdown(f"**{job['companyName']}**")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("💰 Salary", job["salary"] or "—")
+    m2.metric("💼 Experience", job["experience"] or "—")
+    m3.metric("📍 Location", job["primary_city"])
+    m4.metric("⭐ Rating", "—" if pd.isna(job["AggregateRating"]) else f"{job['AggregateRating']:.1f}")
+    st.caption(f"Posted: {job['jobUploaded'] or '—'}  ·  Work mode: {job['work_mode']}  ·  "
+               f"Full location: {job['location']}")
+    if job["skills"]:
+        st.markdown("**Skills**")
+        st.markdown(chips(job["skills"]), unsafe_allow_html=True)
+    with st.expander("Job description", expanded=True):
+        text = job["desc_clean"] or "No description available."
+        st.markdown(
+            f"<div style='white-space:pre-wrap'>{html.escape(text)}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ------------------------------------------------------------------
+# PAGE: CAREER INSIGHTS
+# ------------------------------------------------------------------
+def page_career(df: pd.DataFrame, meta: dict) -> None:
+    banner("🎯 Career Insights",
+           "See what similar jobs pay and which skills to add next")
+
+    c1, c2, c3, c4 = st.columns(4)
+    role = c1.text_input("Job role contains", placeholder="e.g. data analyst", key="ci_role")
+    skill = c2.selectbox("Skill", ["Any"] + meta["skill_options"], key="ci_skill")
+    city = c3.selectbox("City", ["Any"] + meta["city_options"][:30], key="ci_city")
+    years = c4.slider("Your experience (years)", 0, EXP_CAP, 3, key="ci_years")
+
+    m = df.dropna(subset=["salary_lpa"])
+    if role.strip():
+        m = m[m["title"].str.contains(role.strip(), case=False, regex=False)]
+    if skill != "Any":
+        m = m[m["skills"].apply(lambda lst: skill in lst)]
+    if city != "Any":
+        m = m[m["cities"].apply(lambda lst: city in lst)]
+    m = m[(m["exp_min"] <= years) & (m["exp_max"] >= years)]
+
+    if m.empty:
+        st.warning("No matching jobs. Try removing the role keyword, skill or city.")
+        return
+    if len(m) < 10:
+        st.info(f"Only {len(m)} matching jobs - treat the numbers below as a rough guide.")
+
+    st.subheader(f"💰 Expected Salary - {len(m):,} matching jobs")
+    q1, med, q3 = m["salary_lpa"].quantile([0.25, 0.5, 0.75])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Lower range (25%)", lpa(q1))
+    k2.metric("Typical (median)", lpa(med))
+    k3.metric("Upper range (75%)", lpa(q3))
+    k4.metric("Matching jobs", f"{len(m):,}")
+    st.caption("Half of the matching jobs pay between the lower and upper range.")
+
+    a, b = st.columns(2)
+    with a:
+        st.subheader("📊 Salary Spread")
+        salary_hist(m["salary_lpa"], bins=20)
+    with b:
+        st.subheader("🏢 Companies Hiring")
+        hbar(counts_df(m["companyName"], "Company"), "Company", "Jobs")
+
+    st.subheader("🧠 Skills to Learn Next")
+    skills = m["skills"].explode().dropna()
+    if skill != "Any":
+        skills = skills[skills != skill]
+    hbar(counts_df(skills, "Skill", top=12), "Skill", "Jobs", color=ACCENT)
+    st.caption("Skills most often requested together in the matching jobs.")
+
+    st.subheader("📋 Top Matching Jobs")
+    show_table(table_columns(m.nlargest(15, "salary_lpa")), height=420, column_config=TABLE_CONFIG)
+
+
+# ------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------
+def main() -> None:
+    version = tuple(int(x) for x in re.findall(r"\d+", st.__version__)[:2])
+    if version < (1, 30):
+        st.error(f"Streamlit {st.__version__} is too old. Run:  pip install --upgrade streamlit")
+        st.stop()
+
+    st.markdown(CSS, unsafe_allow_html=True)
+    df = get_data()
+    meta = build_meta(df)
+
+    st.sidebar.title("💼 Job Market")
+    page = st.sidebar.radio("Navigate", PAGES, key="nav")
+
+    if page in (P_DASH, P_EXPL):
+        filtered = render_filters(df, meta)
+    else:
+        keep_filters_alive(meta)
+        filtered = df
+
+    if page == P_HOME:
+        page_home(df)
+    elif page == P_DASH:
+        page_dashboard(filtered, df)
+    elif page == P_EXPL:
+        page_explorer(filtered)
+    else:
+        page_career(df, meta)
+
+
+if __name__ == "__main__":
+    main()
