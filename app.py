@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import math
 import re
+from difflib import SequenceMatcher
 from collections import Counter
 from pathlib import Path
 
@@ -43,7 +44,8 @@ P_HOME = "🏠 Home"
 P_DASH = "📊 Dashboard"
 P_EXPL = "🔎 Job Explorer"
 P_CAREER = "🎯 Career Insights"
-PAGES = [P_HOME, P_DASH, P_EXPL, P_CAREER]
+P_AI = "🤖 Smart Career Tools"
+PAGES = [P_HOME, P_DASH, P_EXPL, P_CAREER, P_AI]
 
 EXP_ORDER = [
     "Fresher (0-2 yrs)",
@@ -79,33 +81,172 @@ CITY_ALIASES = {
 # ------------------------------------------------------------------
 # STYLING
 # ------------------------------------------------------------------
-CSS = f"""
+CSS = """
 <style>
-.block-container {{padding-top: 2rem; padding-bottom: 3rem;}}
-footer {{visibility: hidden;}}
-.hero {{
-    background: linear-gradient(135deg, {BRAND_DARK}, {BRAND});
-    padding: 40px 30px; border-radius: 18px; text-align: center;
+/* =========================
+   MEDIUM MODERN THEME
+   ========================= */
+.block-container {
+    padding-top: 1.8rem;
+    padding-bottom: 3rem;
+    max-width: 1450px;
+}
+footer {visibility: hidden;}
+
+/* Main background */
+.stApp {
+    background:
+        radial-gradient(circle at 10% 0%, rgba(99,102,241,.08), transparent 30%),
+        radial-gradient(circle at 90% 10%, rgba(168,85,247,.07), transparent 28%),
+        #f5f7fb;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #111827 0%, #1e293b 100%);
+    border-right: 1px solid rgba(255,255,255,.08);
+}
+section[data-testid="stSidebar"] * {
+    color: #f8fafc !important;
+}
+section[data-testid="stSidebar"] .stRadio label {
+    border-radius: 10px;
+    padding: 5px 8px;
+}
+section[data-testid="stSidebar"] .stRadio label:hover {
+    background: rgba(255,255,255,.08);
+}
+
+/* Hero */
+.hero {
+    background: linear-gradient(135deg, #334155 0%, #4f46e5 52%, #7c3aed 100%);
+    padding: 38px 30px;
+    border-radius: 20px;
+    text-align: center;
     margin-bottom: 24px;
-}}
-.hero h1 {{color: white; margin: 0 0 8px 0; font-size: 2.1rem;}}
-.hero p {{color: rgba(255,255,255,.92); font-size: 1.05rem; margin: 0;}}
-.card {{
-    background: rgba(46,117,182,.10); border: 1px solid rgba(46,117,182,.35);
-    border-radius: 14px; padding: 22px; min-height: 190px;
-}}
-.card h3 {{margin-top: 0; font-size: 1.15rem;}}
-.card p {{margin-bottom: 0; opacity: .9;}}
-div[data-testid="stMetric"] {{
-    background: rgba(46,117,182,.08); border: 1px solid rgba(46,117,182,.25);
-    padding: 14px 16px; border-radius: 12px;
-}}
-.chip {{
-    display: inline-block; padding: 3px 11px; margin: 3px 4px 3px 0;
-    border-radius: 999px; font-size: .82rem;
-    background: rgba(46,117,182,.15); border: 1px solid rgba(46,117,182,.4);
-}}
-.section-note {{opacity: .7; font-size: .85rem;}}
+    box-shadow: 0 12px 30px rgba(51,65,85,.18);
+}
+.hero h1 {
+    color: white;
+    margin: 0 0 8px 0;
+    font-size: 2.15rem;
+    font-weight: 750;
+}
+.hero p {
+    color: rgba(255,255,255,.90);
+    font-size: 1.02rem;
+    margin: 0;
+}
+
+/* Cards */
+.card {
+    background: rgba(255,255,255,.92);
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+    padding: 22px;
+    min-height: 185px;
+    box-shadow: 0 5px 18px rgba(15,23,42,.06);
+    transition: transform .18s ease, box-shadow .18s ease;
+}
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 9px 24px rgba(15,23,42,.10);
+}
+.card h3 {
+    margin-top: 0;
+    font-size: 1.12rem;
+    color: #1e293b;
+}
+.card p {
+    margin-bottom: 0;
+    color: #64748b;
+}
+
+/* KPI cards */
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,.94);
+    border: 1px solid #e2e8f0;
+    padding: 14px 16px;
+    border-radius: 14px;
+    box-shadow: 0 4px 14px rgba(15,23,42,.05);
+}
+div[data-testid="stMetricLabel"] {
+    color: #64748b !important;
+}
+div[data-testid="stMetricValue"] {
+    color: #1e293b !important;
+}
+
+/* Buttons */
+.stButton > button,
+.stDownloadButton > button {
+    border-radius: 10px;
+    border: 1px solid #6366f1;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: white;
+    font-weight: 650;
+    min-height: 42px;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    border-color: #4338ca;
+    box-shadow: 0 6px 16px rgba(79,70,229,.22);
+}
+
+/* Inputs */
+div[data-baseweb="input"] > div,
+div[data-baseweb="select"] > div,
+textarea {
+    border-radius: 10px !important;
+}
+div[data-baseweb="input"] > div:focus-within,
+div[data-baseweb="select"] > div:focus-within {
+    border-color: #6366f1 !important;
+    box-shadow: 0 0 0 1px #6366f1 !important;
+}
+
+/* Tabs */
+button[data-baseweb="tab"] {
+    font-weight: 650;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: #4f46e5 !important;
+}
+
+/* Chips */
+.chip {
+    display: inline-block;
+    padding: 4px 11px;
+    margin: 3px 4px 3px 0;
+    border-radius: 999px;
+    font-size: .82rem;
+    background: #eef2ff;
+    color: #4338ca;
+    border: 1px solid #c7d2fe;
+}
+
+/* Info / success boxes */
+div[data-testid="stAlert"] {
+    border-radius: 12px;
+}
+
+/* Tables */
+div[data-testid="stDataFrame"] {
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+}
+
+/* Section text */
+.section-note {
+    color: #64748b;
+    font-size: .85rem;
+}
+
+/* Dividers */
+hr {
+    border-color: #e2e8f0;
+}
 </style>
 """
 
@@ -611,6 +752,7 @@ def page_home(df: pd.DataFrame) -> None:
                                "range people get - plus the skills to learn next."),
         ("🧠 Skills Discovery", "Find the most in-demand skills and which skills pay the most "
                                 "(Dashboard → Skills tab)."),
+        ("🤖 Smart Career Tools", "Get job recommendations, identify skill gaps and estimate salary from the dataset."),
     ]
     cols = st.columns(len(cards))
     for col, (title, text) in zip(cols, cards):
@@ -918,6 +1060,179 @@ def page_career(df: pd.DataFrame, meta: dict) -> None:
 
 
 # ------------------------------------------------------------------
+# PAGE: SMART CAREER TOOLS (no sklearn / no extra ML package required)
+# ------------------------------------------------------------------
+def _normal_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-zA-Z0-9+#.]+", str(text).lower()) if len(w) > 1}
+
+
+def _skill_match(a: str, b: str) -> float:
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.9
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def smart_recommend_jobs(df: pd.DataFrame, profile: str, top_n: int = 10) -> pd.DataFrame:
+    """Lightweight job recommender using word overlap + skill overlap."""
+    query_words = _normal_words(profile)
+    if not query_words:
+        return pd.DataFrame()
+
+    rows = []
+    for idx, row in df.iterrows():
+        title_words = _normal_words(row.get("title", ""))
+        skill_text = " ".join(row.get("skills", []) if isinstance(row.get("skills", []), list) else [])
+        desc_words = _normal_words(row.get("desc_clean", ""))
+        company_words = _normal_words(row.get("companyName", ""))
+        text_words = title_words | _normal_words(skill_text) | desc_words | company_words
+        overlap = len(query_words & text_words) / max(1, len(query_words))
+        title_overlap = len(query_words & title_words) / max(1, len(query_words))
+        skill_overlap = len(query_words & _normal_words(skill_text)) / max(1, len(query_words))
+        score = 100 * (0.55 * title_overlap + 0.30 * skill_overlap + 0.15 * overlap)
+        if score > 0:
+            rows.append((idx, score))
+
+    if not rows:
+        return pd.DataFrame()
+    scores = pd.DataFrame(rows, columns=["_idx", "Match Score"])
+    scores = scores.sort_values("Match Score", ascending=False).head(top_n)
+    out = df.loc[scores["_idx"].tolist()].copy()
+    out["Match Score (%)"] = scores["Match Score"].round(1).to_numpy()
+    return out
+
+
+def smart_skill_gap(df: pd.DataFrame, role: str, user_skills_text: str, top_n: int = 30):
+    """Compare user's skills with skills frequently requested for a target role."""
+    role = role.strip()
+    user_skills = [x.strip().lower() for x in re.split(r"[,;|]", user_skills_text) if x.strip()]
+    m = df.copy()
+    if role:
+        m = m[m["title"].str.contains(role, case=False, regex=False, na=False)]
+    if m.empty:
+        return pd.DataFrame(), []
+
+    counts = Counter()
+    for skills in m["skills"]:
+        for s in skills:
+            counts[str(s)] += 1
+
+    common = counts.most_common(top_n)
+    result = []
+    for skill, count in common:
+        matched = any(_skill_match(skill, us) >= 0.86 for us in user_skills)
+        result.append({
+            "Skill": skill,
+            "Jobs Requiring It": count,
+            "Status": "Already have" if matched else "Skill gap",
+        })
+    table = pd.DataFrame(result)
+    missing = table[table["Status"] == "Skill gap"]["Skill"].tolist() if not table.empty else []
+    return table, missing
+
+
+def smart_salary_estimate(df: pd.DataFrame, role: str, city: str, years: int, mode: str):
+    """Estimate salary from comparable jobs using median + simple market adjustments."""
+    m = df.dropna(subset=["salary_lpa"]).copy()
+    if role.strip():
+        role_m = m[m["title"].str.contains(role.strip(), case=False, regex=False, na=False)]
+        if len(role_m) >= 5:
+            m = role_m
+    if city != "Any":
+        city_m = m[m["cities"].apply(lambda x: city in x)]
+        if len(city_m) >= 5:
+            m = city_m
+    if mode != "Any":
+        mode_m = m[m["work_mode"] == mode]
+        if len(mode_m) >= 5:
+            m = mode_m
+    if m.empty:
+        return None, None, None, 0
+
+    # Prefer jobs whose experience band contains the user's experience.
+    exp_m = m[(m["exp_min"] <= years) & (m["exp_max"] >= years)]
+    if len(exp_m) >= 5:
+        m = exp_m
+
+    median = float(m["salary_lpa"].median())
+    q1 = float(m["salary_lpa"].quantile(0.25))
+    q3 = float(m["salary_lpa"].quantile(0.75))
+    return median, q1, q3, len(m)
+
+
+def page_smart_tools(df: pd.DataFrame, meta: dict) -> None:
+    banner("🤖 Smart Career Tools", "Job recommendations, skill-gap analysis and salary estimation — powered by your job-market data.")
+    st.info("These tools work directly on your CSV data. No API or machine-learning package is required.")
+
+    t1, t2, t3 = st.tabs(["🎯 Job Recommendation", "🧩 Skill Gap Analyzer", "💰 Salary Estimator"])
+
+    with t1:
+        st.subheader("🎯 Find jobs that match your profile")
+        profile = st.text_area(
+            "Enter your skills / profile",
+            placeholder="Example: Python, SQL, Power BI, Excel, data analysis",
+            height=100,
+            key="smart_profile",
+        )
+        n = st.slider("Number of recommendations", 5, 20, 10, key="smart_rec_n")
+        if st.button("🔎 Recommend Jobs", key="smart_rec_btn"):
+            recs = smart_recommend_jobs(df, profile, n)
+            if recs.empty:
+                st.warning("No close matches found. Try adding more skills or a job role.")
+            else:
+                st.success(f"Found {len(recs)} matching jobs.")
+                show_table(table_columns(recs), column_config=TABLE_CONFIG)
+                st.download_button(
+                    "⬇️ Download recommendations",
+                    data=table_columns(recs).to_csv(index=False).encode("utf-8"),
+                    file_name="job_recommendations.csv",
+                    mime="text/csv",
+                    key="smart_rec_download",
+                )
+
+    with t2:
+        st.subheader("🧩 See which skills you should learn next")
+        c1, c2 = st.columns(2)
+        role = c1.text_input("Target role", placeholder="e.g. Data Analyst", key="smart_gap_role")
+        user_skills = c2.text_input("Your current skills", placeholder="Python, Excel, SQL", key="smart_gap_skills")
+        if st.button("🧠 Analyze Skill Gap", key="smart_gap_btn"):
+            table, missing = smart_skill_gap(df, role, user_skills)
+            if table.empty:
+                st.warning("No jobs found for this role. Try a broader role name.")
+            else:
+                have = int((table["Status"] == "Already have").sum())
+                gaps = int((table["Status"] == "Skill gap").sum())
+                a, b, c = st.columns(3)
+                a.metric("Skills found", len(table))
+                b.metric("You already have", have)
+                c.metric("Skill gaps", gaps)
+                st.dataframe(table, hide_index=True, use_container_width=True)
+                if missing:
+                    st.success("Recommended skills to learn: " + ", ".join(missing[:10]))
+
+    with t3:
+        st.subheader("💰 Estimate a realistic salary range")
+        c1, c2, c3, c4 = st.columns(4)
+        role = c1.text_input("Job role", placeholder="e.g. Data Analyst", key="smart_sal_role")
+        city = c2.selectbox("City", ["Any"] + meta["city_options"][:40], key="smart_sal_city")
+        years = c3.slider("Experience", 0, EXP_CAP, 2, key="smart_sal_years")
+        mode = c4.selectbox("Work mode", ["Any"] + WORK_MODES, key="smart_sal_mode")
+        if st.button("💰 Estimate Salary", key="smart_sal_btn"):
+            med, q1, q3, count = smart_salary_estimate(df, role, city, years, mode)
+            if med is None:
+                st.warning("Not enough salary data for these choices. Try removing the city or role filter.")
+            else:
+                a, b, c, d = st.columns(4)
+                a.metric("Estimated salary", lpa(med))
+                b.metric("Lower range", lpa(q1))
+                c.metric("Upper range", lpa(q3))
+                d.metric("Comparable jobs", f"{count:,}")
+                st.success("This estimate is based on the median and quartiles of comparable jobs in your dataset.")
+
+
+# ------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------
 def main() -> None:
@@ -945,8 +1260,10 @@ def main() -> None:
         page_dashboard(filtered, df)
     elif page == P_EXPL:
         page_explorer(filtered)
-    else:
+    elif page == P_CAREER:
         page_career(df, meta)
+    else:
+        page_smart_tools(df, meta)
 
 
 if __name__ == "__main__":
